@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32-CAM Stream</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 20px auto;
+            text-align: center;
+            background-color: #f5f5f5;
+            padding: 0 20px;
+        }
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+        #videoCanvas {
+            max-width: 100%;
+            height: auto;
+            background-color: #f0f0f0;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            margin: 20px 0;
+        }
+        .button-container {
+            margin: 20px 0;
+        }
+        button {
+            margin: 0 10px;
+            padding: 12px 24px;
+            border-radius: 4px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            border: none;
+        }
+        #startStream {
+            background-color: #4CAF50;
+            color: white;
+        }
+        #startStream:hover {
+            background-color: #45a049;
+        }
+        #stopStream {
+            background-color: #f44336;
+            color: white;
+        }
+        #stopStream:hover {
+            background-color: #da190b;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+            opacity: 0.7;
+        }
+        #status {
+            margin: 20px 0;
+            padding: 15px;
+            border-radius: 5px;
+            background-color: #f8f9fa;
+            border: 1px solid #e9ecef;
+        }
+        #status p {
+            margin: 0;
+            color: #495057;
+        }
+        #stats {
+            font-size: 0.9em;
+            color: #666;
+            margin-top: 10px;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+            border: 1px solid #e9ecef;
+        }
+        .error {
+            color: #dc3545;
+            font-weight: bold;
+        }
+        .success {
+            color: #28a745;
+        }
+        .connecting {
+            color: #ffc107;
+        }
+        .header {
+            margin-bottom: 20px;
+        }
+        .header h1 {
+            color: #2c3e50;
+            margin-bottom: 10px;
+        }
+        .header p {
+            color: #666;
+            margin: 0;
+        }
+        @media (max-width: 600px) {
+            .container {
+                padding: 10px;
+            }
+            button {
+                width: 100%;
+                margin: 5px 0;
+            }
+            .button-container {
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>ESP32-CAM Stream</h1>
+            <p>Visualisation du flux vidéo en temps réel</p>
+        </div>
+        
+        <div id="status">
+            <p>Initialisation de la connexion...</p>
+        </div>
+
+        <div class="button-container">
+            <button id="startStream" disabled>Démarrer Stream</button>
+            <button id="stopStream" disabled>Arrêter Stream</button>
+        </div>
+
+        <canvas id="videoCanvas" width="640" height="480"></canvas>
+        
+        <div id="stats"></div>
+    </div>
+
+    <script>
+        class VideoStream {
+            constructor() {
+                this.socket = null;
+                this.isStreaming = false;
+                this.lastFrameTime = 0;
+                this.frameCount = 0;
+                this.fps = 0;
+                this.totalFrames = 0;
+                this.droppedFrames = 0;
+                this.reconnectAttempts = 0;
+                this.maxReconnectAttempts = 5;
+                this.reconnectDelay = 5000;
+                
+                this.videoCanvas = document.getElementById('videoCanvas');
+                this.ctx = this.videoCanvas.getContext('2d');
+                this.startButton = document.getElementById('startStream');
+                this.stopButton = document.getElementById('stopStream');
+                this.statusDiv = document.getElementById('status');
+                this.statsDiv = document.getElementById('stats');
+
+                this.initializeWebSocket();
+                this.setupEventListeners();
+                this.startStatsUpdate();
+            }
+
+            updateStatus(message, type = 'info') {
+                const p = this.statusDiv.querySelector('p') || document.createElement('p');
+                p.textContent = message;
+                p.className = type;
+                this.statusDiv.innerHTML = '';
+                this.statusDiv.appendChild(p);
+                console.log(`[Status ${type}]`, message);
+            }
+
+            initializeWebSocket() {
+                if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+                    this.socket.close();
+                }
+
+                this.updateStatus('Connexion au serveur...', 'connecting');
+                this.socket = new WebSocket('wss://ikrame-s-websocket-server.glitch.me');
+                this.socket.binaryType = 'arraybuffer';
+                
+                this.socket.onopen = () => {
+                    this.reconnectAttempts = 0;
+                    this.updateStatus('Connecté au serveur', 'success');
+                    this.startButton.disabled = false;
+                    console.log('Envoi register-web');
+                    this.socket.send(JSON.stringify({
+                        type: 'register-web'
+                    }));
+                };
+
+                this.socket.onclose = () => {
+                    this.updateStatus('Déconnecté du serveur', 'error');
+                    this.stopStream();
+                    this.startButton.disabled = true;
+                    
+                    if (this.reconnectAttempts < this.maxReconnectAttempts) {
+                        this.reconnectAttempts++;
+                        this.updateStatus(`Tentative de reconnexion ${this.reconnectAttempts}/${this.maxReconnectAttempts}...`, 'connecting');
+                        setTimeout(() => this.initializeWebSocket(), this.reconnectDelay);
+                    } else {
+                        this.updateStatus('Échec de reconnexion après plusieurs tentatives. Rafraîchissez la page.', 'error');
+                    }
+                };
+
+                this.socket.onerror = (error) => {
+                    console.error('Erreur WebSocket:', error);
+                    this.updateStatus('Erreur de connexion', 'error');
+                };
+
+                this.socket.onmessage = this.handleMessage.bind(this);
+            }
+
+            setupEventListeners() {
+                this.startButton.addEventListener('click', () => this.startStream());
+                this.stopButton.addEventListener('click', () => this.stopStream());
+
+                // Gérer la visibilité de la page
+                document.addEventListener('visibilitychange', () => {
+                    if (document.hidden && this.isStreaming) {
+                        this.stopStream();
+                        this.updateStatus('Stream arrêté - Page masquée');
+                    }
+                });
+            }
+
+            handleMessage = async (event) => {
+                if (event.data instanceof ArrayBuffer) {
+                    await this.handleVideoFrame(event.data);
+                    return;
+                }
+
+                try {
+                    const message = JSON.parse(event.data);
+                    console.log('Message reçu:', message);
+                    
+                    switch (message.type) {
+                        case 'status':
+                            this.updateStatus(message.message, 'info');
+                            if (message.message.includes('ESP32-CAM connecté')) {
+                                this.startButton.disabled = false;
+                            } else if (message.message.includes('ESP32-CAM déconnecté')) {
+                                this.stopStream();
+                                this.startButton.disabled = true;
+                            }
+                            break;
+                        case 'error':
+                            this.updateStatus(`Erreur: ${message.message}`, 'error');
+                            if (this.isStreaming) {
+                                this.stopStream();
+                            }
+                            break;
+                        case 'stream-started':
+                            this.updateStatus('Stream en cours', 'success');
+                            break;
+                        case 'stream-stopped':
+                            this.stopStream();
+                            break;
+                    }
+                } catch (error) {
+                    console.error('Erreur traitement message:', error);
+                }
+            }
+
+            async handleVideoFrame(data) {
+                if (!this.isStreaming) return;
+                
+                try {
+                    const blob = new Blob([data], { type: 'image/jpeg' });
+                    const imageUrl = URL.createObjectURL(blob);
+                    const img = new Image();
+                    
+                    img.onload = () => {
+                        this.ctx.drawImage(img, 0, 0, this.videoCanvas.width, this.videoCanvas.height);
+                        URL.revokeObjectURL(imageUrl);
+                        this.updateFrameStats();
+                    };
+                    
+                    img.onerror = (error) => {
+                        console.error('Erreur lors du chargement de l\'image:', error);
+                        URL.revokeObjectURL(imageUrl);
+                        this.droppedFrames++;
+                    };
+                    
+                    img.src = imageUrl;
+                } catch (error) {
+                    console.error('Erreur lors du traitement de la frame:', error);
+                    this.droppedFrames++;
+                }
+            }
+
+            startStream() {
+                if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+                    this.updateStatus('Pas de connexion au serveur', 'error');
+                    return;
+                }
+
+                this.isStreaming = true;
+                console.log('Envoi start-stream');
+                this.socket.send(JSON.stringify({ 
+                    type: 'start-stream'
+                }));
+                
+                this.updateStatus('Démarrage du stream...', 'connecting');
+                this.startButton.disabled = true;
+                this.stopButton.disabled = false;
+                this.lastFrameTime = performance.now();
+                this.frameCount = 0;
+            }
+
+            stopStream() {
+                this.isStreaming = false;
+                if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+                    this.socket.send(JSON.stringify({ 
+                        type: 'stop-stream'
+                    }));
+                }
+                
+                this.ctx.clearRect(0, 0, this.videoCanvas.width, this.videoCanvas.height);
+                this.updateStatus('Stream arrêté', 'info');
+                this.startButton.disabled = false;
+                this.stopButton.disabled = true;
+            }
+
+            updateFrameStats() {
+                const now = performance.now();
+                this.frameCount++;
+                this.totalFrames++;
+                
+                const elapsed = now - this.lastFrameTime;
+                if (elapsed >= 1000) {
+                    this.fps = Math.round((this.frameCount * 1000) / elapsed);
+                    this.frameCount = 0;
+                    this.lastFrameTime = now;
+                    this.updateStats();
+                }
+            }
+
+            updateStats() {
+                const qualityRatio = ((this.totalFrames - this.droppedFrames) / Math.max(1, this.totalFrames) * 100).toFixed(1);
+                this.statsDiv.innerHTML = `
+                    FPS: ${this.fps} | 
+                    Frames reçues: ${this.totalFrames} | 
+                    Frames perdues: ${this.droppedFrames} | 
+                    Qualité: ${qualityRatio}%
+                `;
+            }
+
+            startStatsUpdate() {
+                setInterval(() => {
+                    this.updateStats();
+                }, 1000);
+            }
+        }
+
+        // Initialisation du stream quand la page est chargée
+        document.addEventListener('DOMContentLoaded', () => {
+            window.videoStream = new VideoStream();
+        });
+    </script>
+</body>
+</html>
